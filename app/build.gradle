@@ -1,0 +1,34 @@
+plugins {
+    id "com.android.application"
+}
+
+def localProperties = new Properties()
+def localPropertiesFile = rootProject.file("local.properties")
+if (localPropertiesFile.exists()) {
+    localPropertiesFile.withInputStream { stream ->
+        localProperties.load(stream)
+    }
+}
+
+def openRouterApiKey = localProperties.getProperty("openrouter.api.key", "")
+def escapedOpenRouterApiKey = openRouterApiKey
+        .replace("\\", "\\\\")
+        .replace("\"", "\\\"")
+
+android {
+    namespace "com.example.smsllmgateway"
+    compileSdk 35
+
+    buildFeatures {
+        buildConfig true
+    }
+
+    defaultConfig {
+        applicationId "com.example.smsllmgateway"
+        minSdk 23
+        targetSdk 35
+        versionCode 1
+        versionName "1.0"
+        buildConfigField "String", "DEFAULT_OPENROUTER_API_KEY", "\"${escapedOpenRouterApiKey}\""
+    }
+}
