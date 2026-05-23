@@ -1,13 +1,14 @@
 package com.example.smsllmgateway;
 
 import org.json.JSONArray;
+import org.json.JSONException;
 import org.json.JSONObject;
 
-import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
+import java.io.Reader;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
@@ -22,11 +23,27 @@ final class LlmClient {
             String model,
             String systemPrompt,
             JSONArray history,
-            String userMessage) throws Exception {
+            String userMessage,
+            LlmOptions options) throws Exception {
+
+        LlmOptions opts = options != null ? options : LlmOptions.defaults();
+
         JSONObject payload = new JSONObject();
         payload.put("model", model);
-        payload.put("temperature", 0.4);
-        payload.put("max_tokens", 220);
+        payload.put("temperature", opts.temperature);
+        payload.put("max_tokens", opts.maxTokens);
+
+        if (opts.thinking) {
+            // OpenRouter and several providers honour this. Models that don't support
+            // thinking simply ignore the field.
+            payload.put("reasoning", new JSONObject().put("enabled", true));
+        }
+        if (opts.webSearch) {
+            // OpenRouter web-search plugin. Works with any model on OpenRouter.
+            JSONArray plugins = new JSONArray();
+            plugins.put(new JSONObject().put("id", "web"));
+            payload.put("plugins", plugins);
+        }
 
         JSONArray messages = new JSONArray();
         messages.put(new JSONObject()
@@ -47,37 +64,54 @@ final class LlmClient {
 
         byte[] requestBytes = payload.toString().getBytes(StandardCharsets.UTF_8);
         HttpURLConnection connection = (HttpURLConnection) new URL(endpoint).openConnection();
-        connection.setRequestMethod("POST");
-        connection.setConnectTimeout(20_000);
-        connection.setReadTimeout(90_000);
-        connection.setDoOutput(true);
-        connection.setRequestProperty("Content-Type", "application/json; charset=utf-8");
-        connection.setRequestProperty("X-Title", "SMS LLM Gateway");
-        connection.setRequestProperty("HTTP-Referer", "https://local.sms-llm-gateway");
-        if (apiKey != null && !apiKey.trim().isEmpty()) {
-            connection.setRequestProperty("Authorization", "Bearer " + apiKey.trim());
+        try {
+            connection.setRequestMethod("POST");
+            connection.setConnectTimeout(20_000);
+            connection.setReadTimeout(90_000);
+            connection.setDoOutput(true);
+            connection.setRequestProperty("Content-Type", "application/json; charset=utf-8");
+            connection.setRequestProperty("X-Title", "SMS LLM Gateway");
+            connection.setRequestProperty("HTTP-Referer", "https://local.sms-llm-gateway");
+            if (apiKey != null && !apiKey.trim().isEmpty()) {
+                connection.setRequestProperty("Authorization", "Bearer " + apiKey.trim());
+            }
+
+            try (OutputStream outputStream = connection.getOutputStream()) {
+                outputStream.write(requestBytes);
+            }
+
+            int code = connection.getResponseCode();
+            String response = readFully(code >= 200 && code < 300
+                    ? connection.getInputStream()
+                    : connection.getErrorStream());
+
+            if (code < 200 || code >= 300) {
+                throw new IOException("LLM HTTP " + code + ": " + response);
+            }
+
+            return parseAnswer(response);
+        } finally {
+            connection.disconnect();
         }
+    }
 
-        try (OutputStream outputStream = connection.getOutputStream()) {
-            outputStream.write(requestBytes);
+    /** Parses an OpenAI-compatible Chat Completions JSON response. Package-private for tests. */
+    static String parseAnswer(String response) throws IOException {
+        JSONObject json;
+        try {
+            json = new JSONObject(response);
+        } catch (JSONException e) {
+            throw new IOException("Invalid LLM response JSON: " + e.getMessage(), e);
         }
-
-        int code = connection.getResponseCode();
-        String response = readFully(code >= 200 && code < 300
-                ? connection.getInputStream()
-                : connection.getErrorStream());
-
-        if (code < 200 || code >= 300) {
-            throw new IOException("LLM HTTP " + code + ": " + response);
-        }
-
-        JSONObject json = new JSONObject(response);
         JSONArray choices = json.optJSONArray("choices");
         if (choices == null || choices.length() == 0) {
             throw new IOException("LLM response has no choices: " + response);
         }
 
-        JSONObject choice = choices.getJSONObject(0);
+        JSONObject choice = choices.optJSONObject(0);
+        if (choice == null) {
+            throw new IOException("LLM response choice is not an object: " + response);
+        }
         String content = extractText(choice).trim();
         if (isEmptyContent(content)) {
             throw new IOException("LLM response is empty");
@@ -85,7 +119,7 @@ final class LlmClient {
         return content;
     }
 
-    private static String extractText(JSONObject choice) {
+    static String extractText(JSONObject choice) {
         JSONObject message = choice.optJSONObject("message");
         if (message != null) {
             String content = valueToText(message.opt("content"));
@@ -112,7 +146,7 @@ final class LlmClient {
         return "";
     }
 
-    private static String valueToText(Object value) {
+    static String valueToText(Object value) {
         if (value == null || value == JSONObject.NULL) {
             return "";
         }
@@ -146,7 +180,7 @@ final class LlmClient {
         return String.valueOf(value);
     }
 
-    private static boolean isEmptyContent(String content) {
+    static boolean isEmptyContent(String content) {
         if (content == null) {
             return true;
         }
@@ -162,12 +196,15 @@ final class LlmClient {
             return "";
         }
 
+        // We don't use readLine() because it discards line terminators, which
+        // can corrupt payloads that contain newlines inside JSON string values
+        // (and force us to guess separators when re-assembling).
         StringBuilder result = new StringBuilder();
-        try (BufferedReader reader = new BufferedReader(
-                new InputStreamReader(inputStream, StandardCharsets.UTF_8))) {
-            String line;
-            while ((line = reader.readLine()) != null) {
-                result.append(line);
+        char[] buffer = new char[4096];
+        try (Reader reader = new InputStreamReader(inputStream, StandardCharsets.UTF_8)) {
+            int read;
+            while ((read = reader.read(buffer)) != -1) {
+                result.append(buffer, 0, read);
             }
         }
         return result.toString();

@@ -6,30 +6,58 @@ import android.app.job.JobService;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.os.Build;
-import android.telephony.SubscriptionManager;
+import android.os.PersistableBundle;
 import android.telephony.SmsManager;
+import android.telephony.SubscriptionManager;
 import android.util.Log;
+
+import com.example.smsllmgateway.commands.CommandBatch;
+import com.example.smsllmgateway.commands.CommandParser;
+import com.example.smsllmgateway.commands.CommandRouter;
+import com.example.smsllmgateway.commands.ParsedCommand;
+import com.example.smsllmgateway.commands.PrefsSettingsGateway;
+import com.example.smsllmgateway.commands.SettingsGateway;
 
 import org.json.JSONArray;
 
 import java.util.ArrayList;
-import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 public class SmsReplyJobService extends JobService {
     private static final String TAG = "SmsReplyJobService";
-    private final ExecutorService executor = Executors.newSingleThreadExecutor();
+    private ExecutorService executor;
+
+    @Override
+    public void onCreate() {
+        super.onCreate();
+        executor = Executors.newSingleThreadExecutor();
+    }
+
+    @Override
+    public void onDestroy() {
+        if (executor != null) {
+            executor.shutdownNow();
+            executor = null;
+        }
+        super.onDestroy();
+    }
 
     @Override
     public boolean onStartJob(JobParameters params) {
-        executor.execute(() -> {
+        ExecutorService runner = executor;
+        if (runner == null || runner.isShutdown()) {
+            runner = Executors.newSingleThreadExecutor();
+            executor = runner;
+        }
+        final ExecutorService finalRunner = runner;
+        finalRunner.execute(() -> {
             try {
                 handleMessage(params);
             } catch (Throwable e) {
                 Log.e(TAG, "Failed to process SMS", e);
-                saveStatus("Ошибка обработки SMS: " + safeMessage(e));
+                saveStatus("Ошибка обработки SMS: " + describeError(e));
             } finally {
                 jobFinished(params, false);
             }
@@ -43,20 +71,29 @@ public class SmsReplyJobService extends JobService {
     }
 
     private void handleMessage(JobParameters params) throws Exception {
-        String sender = params.getExtras().getString(SmsReceiver.EXTRA_SENDER, "");
-        String body = params.getExtras().getString(SmsReceiver.EXTRA_BODY, "").trim();
-        int subscriptionId = params.getExtras().getInt(
-                SmsReceiver.EXTRA_SUBSCRIPTION_ID,
-                SubscriptionManager.INVALID_SUBSCRIPTION_ID);
+        PersistableBundle extras = params.getExtras();
+        String sender = stringExtra(extras, SmsReceiver.EXTRA_SENDER).trim();
+        String body = stringExtra(extras, SmsReceiver.EXTRA_BODY).trim();
+        int subscriptionId = extras != null
+                ? extras.getInt(SmsReceiver.EXTRA_SUBSCRIPTION_ID, SubscriptionManager.INVALID_SUBSCRIPTION_ID)
+                : SubscriptionManager.INVALID_SUBSCRIPTION_ID;
+
         SharedPreferences prefs = getSharedPreferences(GatewayConfig.PREFS, MODE_PRIVATE);
         ConversationStore conversations = new ConversationStore(this);
+        SettingsGateway settings = new PrefsSettingsGateway(prefs, conversations);
 
         if (!prefs.getBoolean(GatewayConfig.KEY_ENABLED, false)) {
             saveStatus("Получено SMS от " + sender + ", но шлюз выключен");
             return;
         }
 
-        if (!isSenderAllowed(sender, prefs.getString(GatewayConfig.KEY_ALLOWED_SENDERS, ""))) {
+        // Без отправителя ответ слать некуда: SmsManager упадёт на пустом destination.
+        if (sender.isEmpty()) {
+            saveStatus("SMS без отправителя проигнорировано");
+            return;
+        }
+
+        if (!PhoneMatcher.isAllowed(sender, settings.getAllowedSenders())) {
             saveStatus("SMS от " + sender + " отклонено по списку разрешенных номеров");
             return;
         }
@@ -65,11 +102,47 @@ public class SmsReplyJobService extends JobService {
             throw new SecurityException("Нет разрешения SEND_SMS");
         }
 
-        SmsManager smsManager = subscriptionId != SubscriptionManager.INVALID_SUBSCRIPTION_ID
-                ? SmsManager.getSmsManagerForSubscriptionId(subscriptionId)
-                : SmsManager.getDefault();
+        SmsManager smsManager = resolveSmsManager(subscriptionId);
 
-        String commandReply = handleCommand(conversations, sender, body);
+        if (body.isEmpty()) {
+            sendSms(smsManager, sender, "Пустое SMS. Отправьте вопрос или HELP.");
+            saveStatus("Пустое SMS от " + sender);
+            return;
+        }
+
+        CommandRouter router = new CommandRouter(settings);
+
+        // Multi-command batch (e.g. "PRESET coder && TOKENS 400 && THINK on")
+        // is a settings macro — never falls through to LLM, even when some
+        // segment isn't a recognised command (we report it inline).
+        if (CommandBatch.isBatch(body)) {
+            String[] segments = CommandBatch.split(body);
+            if (segments.length == 0) {
+                sendSms(smsManager, sender,
+                        "В SMS только разделители && без команд. "
+                                + "Формат: CMD1 && CMD2 && ...");
+                saveStatus("Батч без команд от " + sender);
+                return;
+            }
+            if (segments.length >= 2) {
+                String batchReply = router.routeBatch(sender, segments);
+                int parts = sendSms(smsManager, sender, batchReply);
+                if (parts < 0) {
+                    saveStatus("Эмулятор: SMS-ответ не отправлен. Батч " + segments.length
+                            + " команд. Ответ: " + batchReply);
+                } else {
+                    saveStatus("Батч из " + segments.length + " команд обработан для "
+                            + sender + ", частей SMS: " + parts + ". Ответ: " + batchReply);
+                }
+                return;
+            }
+            // Single useful segment ("&&STATUS" / "STATUS&&"): fall through to
+            // the single-command path below using the trimmed segment.
+            body = segments[0];
+        }
+
+        ParsedCommand parsed = CommandParser.parse(body);
+        String commandReply = router.route(sender, parsed);
         if (commandReply != null) {
             int parts = sendSms(smsManager, sender, commandReply);
             if (parts < 0) {
@@ -80,107 +153,89 @@ public class SmsReplyJobService extends JobService {
             return;
         }
 
-        String endpoint = prefs.getString(GatewayConfig.KEY_ENDPOINT, GatewayConfig.DEFAULT_ENDPOINT);
-        String apiKey = prefs.getString(GatewayConfig.KEY_API_KEY, GatewayConfig.DEFAULT_API_KEY);
-        if (apiKey == null || apiKey.trim().isEmpty()) {
-            apiKey = GatewayConfig.DEFAULT_API_KEY;
+        // One-shot per-request overrides via inline markers [WEB] / [THINK].
+        // We extract them *after* the command path, so they only ever influence
+        // LLM calls (commands themselves never go through here).
+        LlmMarkers markers = LlmMarkers.extract(body);
+        String userMessage = markers.cleanedBody;
+        if (userMessage.isEmpty()) {
+            sendSms(smsManager, sender,
+                    "Похоже, в SMS были только маркеры [WEB]/[THINK] без текста. "
+                            + "Добавьте сам вопрос рядом с маркером.");
+            saveStatus("SMS только с маркерами от " + sender);
+            return;
         }
-        String fallbackModel = prefs.getString(GatewayConfig.KEY_MODEL, GatewayConfig.DEFAULT_MODEL);
-        String model = conversations.getModel(sender, fallbackModel);
-        String systemPrompt = buildSystemPrompt(prefs.getString(
-                GatewayConfig.KEY_SYSTEM_PROMPT,
-                GatewayConfig.DEFAULT_SYSTEM_PROMPT));
-        String activeChat = conversations.getActiveChat(sender);
+
+        String endpoint = settings.getEndpoint();
+        String apiKey = settings.getApiKey();
+        String model = settings.getModel(sender);
+        int maxChars = settings.getReplyChars();
+        int tokens = settings.getTokens(sender);
+        double temperature = settings.getTemperature(sender);
+        // Markers can only enable an option, never disable one the user already turned on.
+        boolean thinking = settings.isThinking(sender) || markers.forceThinking;
+        boolean webSearch = settings.isWebSearch(sender) || markers.forceWeb;
+
+        LlmOptions options = new LlmOptions(tokens, temperature, thinking, webSearch);
+        String systemPrompt = PromptPresets.composeSystemPrompt(settings.getPreset(), maxChars, tokens);
+
+        String activeChat = settings.getActiveChat(sender);
         JSONArray history = conversations.getRecentMessages(sender, activeChat);
 
         String answer;
         try {
-            answer = LlmClient.requestChatCompletion(endpoint, apiKey, model, systemPrompt, history, body);
+            answer = LlmClient.requestChatCompletion(
+                    endpoint, apiKey, model, systemPrompt, history, userMessage, options);
         } catch (Exception e) {
             answer = "Не удалось получить ответ от нейросети. Попробуйте еще раз или выберите другую модель командой MODEL LIST.";
             int parts = sendSms(smsManager, sender, answer);
-            saveStatus("Ошибка LLM для " + sender + ": " + safeMessage(e) + ". Отправлен fallback, частей SMS: " + parts);
+            saveStatus("Ошибка LLM для " + sender + ": " + describeError(e)
+                    + ". Отправлен fallback, частей SMS: " + parts);
             return;
         }
-        int maxChars = prefs.getInt(
-                GatewayConfig.KEY_MAX_REPLY_CHARS,
-                GatewayConfig.DEFAULT_MAX_REPLY_CHARS);
-        answer = limit(cleanPlainText(answer), maxChars);
-        if (answer.trim().isEmpty() || "null".equalsIgnoreCase(answer.trim())) {
+
+        answer = TextSanitizer.limit(TextSanitizer.cleanPlainText(answer), maxChars);
+        if (answer == null || answer.trim().isEmpty() || "null".equalsIgnoreCase(answer.trim())) {
             answer = "Нейросеть вернула пустой ответ. Попробуйте еще раз или выберите другую модель командой MODEL LIST.";
         }
 
-        conversations.appendExchange(sender, activeChat, body, answer);
+        // Store the cleaned text in history so future turns don't carry stale markers.
+        conversations.appendExchange(sender, activeChat, userMessage, answer);
         int parts = sendSms(smsManager, sender, answer);
+        String overrideTag = describeOverrides(markers);
         if (parts < 0) {
-            saveStatus("Эмулятор: SMS-ответ не отправлен. Ответ: " + answer);
+            saveStatus("Эмулятор: SMS-ответ не отправлен" + overrideTag + ". Ответ: " + answer);
         } else {
-            saveStatus("Ответ отправлен на " + sender + ", чат: " + activeChat + ", модель: " + model + ", частей SMS: " + parts + ". Ответ: " + answer);
+            saveStatus("Ответ отправлен на " + sender + ", чат: " + activeChat
+                    + ", модель: " + model + overrideTag
+                    + ", частей SMS: " + parts + ". Ответ: " + answer);
         }
     }
 
-    private String handleCommand(ConversationStore conversations, String sender, String body) {
-        String trimmed = body == null ? "" : body.trim();
-        if (trimmed.isEmpty()) {
-            return "Отправьте вопрос или HELP для списка команд.";
+    private static String describeOverrides(LlmMarkers markers) {
+        if (!markers.forceWeb && !markers.forceThinking) {
+            return "";
         }
-
-        String upper = trimmed.toUpperCase(Locale.US);
-        if ("HELP".equals(upper) || "/HELP".equals(upper) || "ПОМОЩЬ".equals(upper)) {
-            return "Команды: STATUS; CHAT LIST; CHAT NEW имя; CHAT USE имя; CHAT CLEAR; MODEL LIST; MODEL 1. Для выбора модели отправьте MODEL LIST, затем MODEL номер.";
+        StringBuilder sb = new StringBuilder(", маркеры: ");
+        if (markers.forceWeb) {
+            sb.append("WEB");
         }
-
-        if ("STATUS".equals(upper) || "/STATUS".equals(upper)) {
-            String chat = conversations.getActiveChat(sender);
-            String model = conversations.getModel(sender, GatewayConfig.DEFAULT_MODEL);
-            return "Статус: включено. Чат: " + chat + ". Модель: " + model + ".";
-        }
-
-        if ("CHAT LIST".equals(upper) || "/CHAT LIST".equals(upper)) {
-            List<String> chats = conversations.listChats(sender);
-            return "Чаты: " + join(chats) + ". Текущий: " + conversations.getActiveChat(sender) + ".";
-        }
-
-        if (upper.startsWith("CHAT NEW ") || upper.startsWith("/CHAT NEW ")) {
-            String name = trimmed.substring(trimmed.toUpperCase(Locale.US).indexOf("CHAT NEW ") + 9).trim();
-            conversations.setActiveChat(sender, name);
-            return "Создан и выбран чат: " + conversations.getActiveChat(sender) + ".";
-        }
-
-        if (upper.startsWith("CHAT USE ") || upper.startsWith("/CHAT USE ")) {
-            String name = trimmed.substring(trimmed.toUpperCase(Locale.US).indexOf("CHAT USE ") + 9).trim();
-            conversations.setActiveChat(sender, name);
-            return "Выбран чат: " + conversations.getActiveChat(sender) + ".";
-        }
-
-        if ("CHAT CLEAR".equals(upper) || "/CHAT CLEAR".equals(upper)) {
-            String chat = conversations.getActiveChat(sender);
-            conversations.clearChat(sender, chat);
-            return "История текущего чата очищена: " + chat + ".";
-        }
-
-        if ("MODEL LIST".equals(upper) || "/MODEL LIST".equals(upper)) {
-            return "Доступные модели:\n" + numberedModelList() + "\nВыбор: отправьте MODEL 1, MODEL 2 или MODEL 3.";
-        }
-
-        if (upper.matches("/?MODEL\\s+\\d+")) {
-            String numberText = upper.replace("/", "").replace("MODEL", "").trim();
-            return selectModelByNumber(conversations, sender, numberText);
-        }
-
-        if (upper.startsWith("MODEL USE ") || upper.startsWith("/MODEL USE ")) {
-            String model = trimmed.substring(upper.indexOf("MODEL USE ") + 10).trim();
-            if (model.isEmpty()) {
-                return "Укажите номер или id модели. Примеры: MODEL 1 или MODEL USE openrouter/free.";
+        if (markers.forceThinking) {
+            if (markers.forceWeb) {
+                sb.append('+');
             }
-            if (model.matches("\\d+")) {
-                return selectModelByNumber(conversations, sender, model);
-            }
-            conversations.setModel(sender, model);
-            return "Выбрана модель: " + model + ".";
+            sb.append("THINK");
         }
+        return sb.toString();
+    }
 
-        return null;
+    private static String stringExtra(PersistableBundle extras, String key) {
+        if (extras == null) {
+            return "";
+        }
+        // PersistableBundle.getString(key, default) requires API 24; minSdk is 23.
+        String value = extras.getString(key);
+        return value != null ? value : "";
     }
 
     private int sendSms(SmsManager smsManager, String sender, String text) {
@@ -188,9 +243,99 @@ public class SmsReplyJobService extends JobService {
             Log.i(TAG, "Running on emulator, skipping outgoing SMS: " + text);
             return -1;
         }
-        ArrayList<String> parts = smsManager.divideMessage(text);
-        smsManager.sendMultipartTextMessage(sender, null, parts, null, null);
+        if (smsManager == null) {
+            throw new RuntimeException("SmsManager недоступен");
+        }
+        ArrayList<String> parts;
+        try {
+            parts = smsManager.divideMessage(text);
+        } catch (SecurityException e) {
+            Log.w(TAG, "divideMessage denied, falling back to manual split", e);
+            return sendSmsManual(smsManager, sender, text);
+        } catch (Throwable e) {
+            Log.e(TAG, "Failed to divide SMS for " + sender, e);
+            throw new RuntimeException("Не удалось подготовить SMS: " + describeError(e), e);
+        }
+        try {
+            smsManager.sendMultipartTextMessage(sender, null, parts, null, null);
+        } catch (SecurityException e) {
+            Log.w(TAG, "sendMultipartTextMessage denied, falling back to manual send", e);
+            return sendSmsManual(smsManager, sender, text);
+        } catch (Throwable e) {
+            Log.e(TAG, "Failed to send SMS to " + sender, e);
+            throw new RuntimeException("Не удалось отправить SMS: " + describeError(e), e);
+        }
         return parts.size();
+    }
+
+    private int sendSmsManual(SmsManager smsManager, String sender, String text) {
+        // 67 UTF-16 chars is safe for UCS-2 (cyrillic). Without divideMessage we can't
+        // reliably detect GSM-7 vs UCS-2, so we take the conservative bound.
+        final int partLength = 67;
+        ArrayList<String> parts = new ArrayList<>();
+        int length = text.length();
+        for (int offset = 0; offset < length; ) {
+            int end = Math.min(offset + partLength, length);
+            // Don't split a surrogate pair across messages.
+            if (end < length && Character.isHighSurrogate(text.charAt(end - 1))) {
+                end -= 1;
+            }
+            if (end <= offset) {
+                end = Math.min(offset + 1, length);
+            }
+            parts.add(text.substring(offset, end));
+            offset = end;
+        }
+        if (parts.isEmpty()) {
+            parts.add("");
+        }
+        try {
+            for (String part : parts) {
+                smsManager.sendTextMessage(sender, null, part, null, null);
+            }
+        } catch (Throwable e) {
+            Log.e(TAG, "Manual sendTextMessage failed for " + sender, e);
+            throw new RuntimeException("Не удалось отправить SMS вручную: " + describeError(e), e);
+        }
+        return parts.size();
+    }
+
+    private SmsManager resolveSmsManager(int subscriptionId) {
+        SmsManager defaultManager = getDefaultSmsManager();
+
+        if (subscriptionId == SubscriptionManager.INVALID_SUBSCRIPTION_ID) {
+            return defaultManager;
+        }
+
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && defaultManager != null) {
+                return defaultManager.createForSubscriptionId(subscriptionId);
+            }
+            return SmsManager.getSmsManagerForSubscriptionId(subscriptionId);
+        } catch (Throwable e) {
+            Log.w(TAG, "Cannot create SmsManager for subscription " + subscriptionId
+                    + ", falling back to default", e);
+            return defaultManager;
+        }
+    }
+
+    private SmsManager getDefaultSmsManager() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            try {
+                SmsManager managerFromService = getSystemService(SmsManager.class);
+                if (managerFromService != null) {
+                    return managerFromService;
+                }
+            } catch (Throwable e) {
+                Log.w(TAG, "getSystemService(SmsManager.class) failed", e);
+            }
+        }
+        try {
+            return SmsManager.getDefault();
+        } catch (Throwable e) {
+            Log.e(TAG, "SmsManager.getDefault() failed", e);
+            return null;
+        }
     }
 
     private boolean isEmulator() {
@@ -204,153 +349,49 @@ public class SmsReplyJobService extends JobService {
                 || "google_sdk".equals(Build.PRODUCT);
     }
 
-    private String safeMessage(Throwable throwable) {
+    private String describeError(Throwable throwable) {
+        if (throwable == null) {
+            return "неизвестная ошибка";
+        }
+        StringBuilder result = new StringBuilder();
+        result.append(throwable.getClass().getSimpleName());
         String message = throwable.getMessage();
-        if (message == null || message.trim().isEmpty()) {
-            return throwable.getClass().getSimpleName();
+        if (message != null && !message.trim().isEmpty()) {
+            result.append(": ").append(message.trim());
         }
-        return message;
-    }
-
-    private String buildSystemPrompt(String savedPrompt) {
-        String base = savedPrompt == null || savedPrompt.trim().isEmpty()
-                ? GatewayConfig.DEFAULT_SYSTEM_PROMPT
-                : savedPrompt.trim();
-        return base + "\n\nMandatory SMS rules: plain text only; no emoji; no markdown; no lists unless necessary; answer in 1-4 short sentences by default.";
-    }
-
-    private String cleanPlainText(String value) {
-        if (value == null) {
-            return "";
+        String origin = topAppFrame(throwable);
+        if (origin != null) {
+            result.append(" @ ").append(origin);
         }
-
-        String cleaned = value
-                .replace("```", "")
-                .replace("**", "")
-                .replace("__", "")
-                .replace("`", "")
-                .replaceAll("(?m)^#{1,6}\\s*", "")
-                .replaceAll("(?m)^>\\s*", "")
-                .replaceAll("[\\t ]+", " ")
-                .replaceAll("\\n{3,}", "\n\n")
-                .trim();
-
-        StringBuilder result = new StringBuilder();
-        for (int offset = 0; offset < cleaned.length(); ) {
-            int codePoint = cleaned.codePointAt(offset);
-            offset += Character.charCount(codePoint);
-            int type = Character.getType(codePoint);
-            if (type == Character.SURROGATE
-                    || type == Character.PRIVATE_USE
-                    || type == Character.UNASSIGNED
-                    || type == Character.OTHER_SYMBOL) {
-                continue;
-            }
-            result.appendCodePoint(codePoint);
-        }
-        return result.toString().trim();
-    }
-
-    private String join(List<String> values) {
-        StringBuilder result = new StringBuilder();
-        for (String value : values) {
-            if (result.length() > 0) {
-                result.append(", ");
-            }
-            result.append(value);
-        }
-        return result.toString();
-    }
-
-    private String join(String[] values) {
-        StringBuilder result = new StringBuilder();
-        for (String value : values) {
-            if (result.length() > 0) {
-                result.append(", ");
-            }
-            result.append(value);
-        }
-        return result.toString();
-    }
-
-    private String numberedModelList() {
-        StringBuilder result = new StringBuilder();
-        for (int i = 0; i < GatewayConfig.SUGGESTED_MODELS.length; i++) {
-            if (result.length() > 0) {
-                result.append('\n');
-            }
-            String name = i < GatewayConfig.SUGGESTED_MODEL_NAMES.length
-                    ? GatewayConfig.SUGGESTED_MODEL_NAMES[i]
-                    : GatewayConfig.SUGGESTED_MODELS[i];
-            result.append(i + 1)
-                    .append(". ")
-                    .append(name)
-                    .append(" (")
-                    .append(GatewayConfig.SUGGESTED_MODELS[i])
-                    .append(")");
-        }
-        return result.toString();
-    }
-
-    private String selectModelByNumber(ConversationStore conversations, String sender, String numberText) {
-        int index;
-        try {
-            index = Integer.parseInt(numberText.trim()) - 1;
-        } catch (NumberFormatException e) {
-            return "Не понял номер модели. Отправьте MODEL LIST, затем MODEL 1.";
-        }
-
-        if (index < 0 || index >= GatewayConfig.SUGGESTED_MODELS.length) {
-            return "Нет модели с таким номером. Отправьте MODEL LIST и выберите номер из списка.";
-        }
-
-        String model = GatewayConfig.SUGGESTED_MODELS[index];
-        conversations.setModel(sender, model);
-        String name = index < GatewayConfig.SUGGESTED_MODEL_NAMES.length
-                ? GatewayConfig.SUGGESTED_MODEL_NAMES[index]
-                : model;
-        return "Выбрана модель " + (index + 1) + ": " + name + ".";
-    }
-
-    private boolean isSenderAllowed(String sender, String allowedSenders) {
-        if (allowedSenders == null || allowedSenders.trim().isEmpty()) {
-            return true;
-        }
-
-        String normalizedSender = normalizePhone(sender);
-        String[] entries = allowedSenders.split("[,;\\n\\r]+");
-        for (String entry : entries) {
-            String normalizedEntry = normalizePhone(entry);
-            if (!normalizedEntry.isEmpty()
-                    && (normalizedSender.equals(normalizedEntry)
-                    || normalizedSender.endsWith(normalizedEntry)
-                    || normalizedEntry.endsWith(normalizedSender))) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    private String normalizePhone(String value) {
-        if (value == null) {
-            return "";
-        }
-        String trimmed = value.trim();
-        StringBuilder result = new StringBuilder();
-        for (int i = 0; i < trimmed.length(); i++) {
-            char c = trimmed.charAt(i);
-            if (Character.isDigit(c) || (c == '+' && result.length() == 0)) {
-                result.append(c);
+        Throwable cause = throwable.getCause();
+        if (cause != null && cause != throwable) {
+            result.append(" <- ").append(cause.getClass().getSimpleName());
+            String causeMessage = cause.getMessage();
+            if (causeMessage != null && !causeMessage.trim().isEmpty()) {
+                result.append(": ").append(causeMessage.trim());
             }
         }
         return result.toString();
     }
 
-    private String limit(String value, int maxChars) {
-        if (maxChars <= 0 || value.length() <= maxChars) {
-            return value;
+    private String topAppFrame(Throwable throwable) {
+        Throwable current = throwable;
+        while (current != null) {
+            StackTraceElement[] trace = current.getStackTrace();
+            if (trace != null) {
+                for (StackTraceElement frame : trace) {
+                    String className = frame.getClassName();
+                    if (className != null && className.startsWith("com.example.smsllmgateway")) {
+                        String fileName = frame.getFileName();
+                        return (fileName != null ? fileName : className)
+                                + ":" + frame.getLineNumber()
+                                + " " + frame.getMethodName();
+                    }
+                }
+            }
+            current = current.getCause();
         }
-        return value.substring(0, maxChars) + "\n\n[Ответ обрезан]";
+        return null;
     }
 
     private void saveStatus(String status) {

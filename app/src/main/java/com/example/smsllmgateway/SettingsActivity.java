@@ -13,21 +13,30 @@ import android.view.ViewGroup;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.LinearLayout;
+import android.widget.RadioButton;
+import android.widget.RadioGroup;
 import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
+
+import java.util.HashMap;
+import java.util.Map;
 
 public class SettingsActivity extends Activity {
     private EditText endpointInput;
     private EditText apiKeyInput;
     private EditText modelInput;
-    private EditText systemPromptInput;
     private EditText allowedSendersInput;
     private EditText maxReplyCharsInput;
+    private RadioGroup presetGroup;
+    private TextView presetPreview;
     private TextView savedText;
     private final Handler autosaveHandler = new Handler(Looper.getMainLooper());
     private final Runnable autosaveRunnable = this::saveSettingsSilently;
     private boolean loading;
+    private boolean dirty;
+    private final Map<Integer, String> radioIdToPresetId = new HashMap<>();
+    private final Map<String, Integer> presetIdToRadioId = new HashMap<>();
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -56,19 +65,43 @@ public class SettingsActivity extends Activity {
         root.addView(title, matchWrap());
 
         TextView hint = new TextView(this);
-        hint.setText("Настройки сохраняются автоматически после изменения.");
+        hint.setText("Настройки сохраняются автоматически. Большинство параметров можно менять и по SMS — отправьте HELP.");
         hint.setPadding(0, 16, 0, 16);
         root.addView(hint, matchWrap());
 
         endpointInput = addInput(root, "LLM endpoint", false);
         apiKeyInput = addInput(root, "API key", true);
-        modelInput = addInput(root, "Model", false);
-        systemPromptInput = addInput(root, "System prompt", false);
-        systemPromptInput.setMinLines(4);
-        systemPromptInput.setGravity(Gravity.TOP);
+        modelInput = addInput(root, "Модель по умолчанию (id или openrouter/auto)", false);
+
+        TextView presetLabel = new TextView(this);
+        presetLabel.setText("Пресет системного промпта");
+        presetLabel.setPadding(0, 24, 0, 8);
+        root.addView(presetLabel, matchWrap());
+
+        presetGroup = new RadioGroup(this);
+        presetGroup.setOrientation(RadioGroup.VERTICAL);
+        for (PromptPresets.Preset preset : PromptPresets.all()) {
+            RadioButton button = new RadioButton(this);
+            button.setText(preset.name + " (" + preset.id + ")");
+            int viewId = android.view.View.generateViewId();
+            button.setId(viewId);
+            radioIdToPresetId.put(viewId, preset.id);
+            presetIdToRadioId.put(preset.id, viewId);
+            presetGroup.addView(button);
+        }
+        presetGroup.setOnCheckedChangeListener((group, checkedId) -> {
+            updatePresetPreview();
+            scheduleAutosave();
+        });
+        root.addView(presetGroup, matchWrap());
+
+        presetPreview = new TextView(this);
+        presetPreview.setPadding(16, 8, 16, 16);
+        presetPreview.setTextSize(13);
+        root.addView(presetPreview, matchWrap());
 
         allowedSendersInput = addInput(root, "Разрешенные номера через запятую, пусто = все", false);
-        maxReplyCharsInput = addInput(root, "Максимум символов в ответе", false);
+        maxReplyCharsInput = addInput(root, "Максимум символов в одном ответе", false);
         maxReplyCharsInput.setInputType(InputType.TYPE_CLASS_NUMBER);
 
         Button saveButton = new Button(this);
@@ -124,6 +157,7 @@ public class SettingsActivity extends Activity {
 
     private void loadSettings() {
         loading = true;
+        dirty = false;
         SharedPreferences prefs = getSharedPreferences(GatewayConfig.PREFS, MODE_PRIVATE);
         endpointInput.setText(prefs.getString(GatewayConfig.KEY_ENDPOINT, GatewayConfig.DEFAULT_ENDPOINT));
         String apiKey = prefs.getString(GatewayConfig.KEY_API_KEY, GatewayConfig.DEFAULT_API_KEY);
@@ -132,9 +166,17 @@ public class SettingsActivity extends Activity {
         }
         apiKeyInput.setText(apiKey);
         modelInput.setText(prefs.getString(GatewayConfig.KEY_MODEL, GatewayConfig.DEFAULT_MODEL));
-        systemPromptInput.setText(prefs.getString(
-                GatewayConfig.KEY_SYSTEM_PROMPT,
-                GatewayConfig.DEFAULT_SYSTEM_PROMPT));
+
+        String presetId = prefs.getString(GatewayConfig.KEY_PRESET, GatewayConfig.DEFAULT_PRESET);
+        if (!PromptPresets.isKnown(presetId)) {
+            presetId = GatewayConfig.DEFAULT_PRESET;
+        }
+        Integer radioId = presetIdToRadioId.get(presetId);
+        if (radioId != null) {
+            presetGroup.check(radioId);
+        }
+        updatePresetPreview();
+
         allowedSendersInput.setText(prefs.getString(GatewayConfig.KEY_ALLOWED_SENDERS, ""));
         maxReplyCharsInput.setText(String.valueOf(prefs.getInt(
                 GatewayConfig.KEY_MAX_REPLY_CHARS,
@@ -143,10 +185,26 @@ public class SettingsActivity extends Activity {
         updateSavedText("Готово");
     }
 
+    private void updatePresetPreview() {
+        if (presetPreview == null) {
+            return;
+        }
+        String presetId = currentPresetId();
+        PromptPresets.Preset preset = PromptPresets.byId(presetId);
+        presetPreview.setText("Промпт: " + preset.prompt);
+    }
+
+    private String currentPresetId() {
+        int checked = presetGroup.getCheckedRadioButtonId();
+        String id = radioIdToPresetId.get(checked);
+        return id != null ? id : GatewayConfig.DEFAULT_PRESET;
+    }
+
     private void scheduleAutosave() {
         if (loading) {
             return;
         }
+        dirty = true;
         updateSavedText("Сохраняю...");
         autosaveHandler.removeCallbacks(autosaveRunnable);
         autosaveHandler.postDelayed(autosaveRunnable, 600);
@@ -157,6 +215,12 @@ public class SettingsActivity extends Activity {
             return;
         }
         autosaveHandler.removeCallbacks(autosaveRunnable);
+        // Если пользователь не редактировал поля — не перезаписываем prefs.
+        // Иначе можно затереть изменения, прилетевшие по SMS (ALLOWED ADD, MODEL N и т.п.),
+        // пока экран настроек был открыт.
+        if (!dirty) {
+            return;
+        }
 
         int maxReplyChars = GatewayConfig.DEFAULT_MAX_REPLY_CHARS;
         try {
@@ -164,17 +228,21 @@ public class SettingsActivity extends Activity {
         } catch (NumberFormatException ignored) {
             maxReplyCharsInput.setText(String.valueOf(maxReplyChars));
         }
+        maxReplyChars = Math.max(
+                GatewayConfig.MIN_REPLY_CHARS,
+                Math.min(GatewayConfig.MAX_REPLY_CHARS_LIMIT, maxReplyChars));
 
         getSharedPreferences(GatewayConfig.PREFS, MODE_PRIVATE)
                 .edit()
                 .putString(GatewayConfig.KEY_ENDPOINT, endpointInput.getText().toString().trim())
                 .putString(GatewayConfig.KEY_API_KEY, apiKeyInput.getText().toString().trim())
                 .putString(GatewayConfig.KEY_MODEL, modelInput.getText().toString().trim())
-                .putString(GatewayConfig.KEY_SYSTEM_PROMPT, systemPromptInput.getText().toString())
+                .putString(GatewayConfig.KEY_PRESET, currentPresetId())
                 .putString(GatewayConfig.KEY_ALLOWED_SENDERS, allowedSendersInput.getText().toString())
                 .putInt(GatewayConfig.KEY_MAX_REPLY_CHARS, maxReplyChars)
                 .apply();
 
+        dirty = false;
         updateSavedText("Сохранено автоматически");
     }
 
