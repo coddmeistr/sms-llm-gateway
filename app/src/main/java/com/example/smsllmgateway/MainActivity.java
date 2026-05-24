@@ -2,10 +2,15 @@ package com.example.smsllmgateway;
 
 import android.Manifest;
 import android.app.Activity;
+import android.content.ActivityNotFoundException;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
+import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
+import android.os.PowerManager;
+import android.provider.Settings;
 import android.view.Gravity;
 import android.view.ViewGroup;
 import android.widget.Button;
@@ -13,15 +18,20 @@ import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.Switch;
 import android.widget.TextView;
+import android.widget.Toast;
 
 import com.example.smsllmgateway.commands.CommandRouter;
+import com.example.smsllmgateway.keepalive.KeepAliveController;
+import com.example.smsllmgateway.keepalive.OemAutostartHelper;
 
 import org.json.JSONArray;
 
 public class MainActivity extends Activity {
     private Switch enabledSwitch;
+    private Switch keepAliveSwitch;
     private TextView summaryText;
     private TextView statusText;
+    private TextView keepAliveStatusText;
 
     private final SharedPreferences.OnSharedPreferenceChangeListener prefsListener =
             (sharedPreferences, key) -> {
@@ -33,6 +43,8 @@ public class MainActivity extends Activity {
                         || GatewayConfig.KEY_ALLOWED_SENDERS.equals(key)
                         || GatewayConfig.KEY_PRESET.equals(key)) {
                     refreshSummary();
+                } else if (GatewayConfig.KEY_KEEP_ALIVE.equals(key)) {
+                    refreshKeepAliveStatus();
                 }
             };
 
@@ -49,6 +61,13 @@ public class MainActivity extends Activity {
         loadMainState();
         getSharedPreferences(GatewayConfig.PREFS, MODE_PRIVATE)
                 .registerOnSharedPreferenceChangeListener(prefsListener);
+        // Self-heal: if the user opens the app, ensure keep-alive is actually
+        // running (it may have been killed by an OEM background-cleaner since
+        // last launch). startForegroundService() from a visible activity is
+        // always allowed, even on Android 12+.
+        if (KeepAliveController.isEnabled(this)) {
+            KeepAliveController.ensureStarted(this, "activity_resume");
+        }
     }
 
     @Override
@@ -87,6 +106,33 @@ public class MainActivity extends Activity {
         });
         root.addView(enabledSwitch, matchWrap());
 
+        keepAliveSwitch = new Switch(this);
+        keepAliveSwitch.setText("Поддерживать работу 24/7");
+        keepAliveSwitch.setTextSize(18);
+        keepAliveSwitch.setOnCheckedChangeListener((buttonView, isChecked) -> {
+            if (isChecked) {
+                requestNotificationPermissionIfNeeded();
+            }
+            KeepAliveController.setEnabled(this, isChecked);
+            refreshKeepAliveStatus();
+        });
+        root.addView(keepAliveSwitch, matchWrap());
+
+        keepAliveStatusText = new TextView(this);
+        keepAliveStatusText.setPadding(0, 4, 0, 16);
+        keepAliveStatusText.setTextSize(12);
+        root.addView(keepAliveStatusText, matchWrap());
+
+        Button batteryButton = new Button(this);
+        batteryButton.setText("Отключить экономию батареи для шлюза");
+        batteryButton.setOnClickListener(v -> requestBatteryOptimizationExemption());
+        root.addView(batteryButton, matchWrap());
+
+        Button autostartButton = new Button(this);
+        autostartButton.setText("Открыть autostart (OEM)");
+        autostartButton.setOnClickListener(v -> openOemAutostartScreen());
+        root.addView(autostartButton, matchWrap());
+
         summaryText = new TextView(this);
         summaryText.setPadding(0, 16, 0, 16);
         root.addView(summaryText, matchWrap());
@@ -122,8 +168,85 @@ public class MainActivity extends Activity {
     private void loadMainState() {
         SharedPreferences prefs = getSharedPreferences(GatewayConfig.PREFS, MODE_PRIVATE);
         enabledSwitch.setChecked(prefs.getBoolean(GatewayConfig.KEY_ENABLED, false));
+        keepAliveSwitch.setChecked(prefs.getBoolean(GatewayConfig.KEY_KEEP_ALIVE, false));
         refreshSummary();
         refreshStatus();
+        refreshKeepAliveStatus();
+    }
+
+    private void refreshKeepAliveStatus() {
+        if (keepAliveStatusText == null) {
+            return;
+        }
+        boolean enabled = KeepAliveController.isEnabled(this);
+        StringBuilder hint = new StringBuilder();
+        hint.append(enabled
+                ? "Keep-alive ON: foreground service + boot receiver + heartbeat."
+                : "Keep-alive OFF: ОС может усыпить процесс в любой момент.");
+        PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
+        if (pm != null) {
+            boolean ignoring = pm.isIgnoringBatteryOptimizations(getPackageName());
+            hint.append("\nЭкономия батареи: ")
+                    .append(ignoring ? "отключена" : "ВКЛЮЧЕНА (нажмите кнопку ниже)");
+        }
+        hint.append("\nПроизводитель: ").append(OemAutostartHelper.describeCurrentManufacturer());
+        keepAliveStatusText.setText(hint.toString());
+    }
+
+    @SuppressWarnings("BatteryLife")
+    private void requestBatteryOptimizationExemption() {
+        PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
+        if (pm != null && pm.isIgnoringBatteryOptimizations(getPackageName())) {
+            Toast.makeText(this, "Уже отключена", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        Intent direct = new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS);
+        direct.setData(Uri.parse("package:" + getPackageName()));
+        try {
+            startActivity(direct);
+            return;
+        } catch (ActivityNotFoundException ignored) {
+            // Some OEMs hide this intent. Fall back to the general list.
+        } catch (SecurityException ignored) {
+            // Play Policy can revoke the permission silently.
+        }
+        try {
+            startActivity(new Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS));
+        } catch (Throwable e) {
+            Toast.makeText(this, "Не удалось открыть настройки батареи: " + e.getMessage(),
+                    Toast.LENGTH_LONG).show();
+        }
+    }
+
+    private void openOemAutostartScreen() {
+        Intent intent = OemAutostartHelper.buildAutostartIntent(this);
+        if (intent == null) {
+            Toast.makeText(this, "Контекст приложения недоступен", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        try {
+            startActivity(intent);
+        } catch (Throwable e) {
+            Toast.makeText(this,
+                    "Не удалось открыть autostart: " + e.getMessage()
+                            + ". Откройте настройки приложения вручную.",
+                    Toast.LENGTH_LONG).show();
+            try {
+                startActivity(OemAutostartHelper.fallbackAppDetailsIntent(getPackageName()));
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    private void requestNotificationPermissionIfNeeded() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+            return;
+        }
+        if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)
+                == PackageManager.PERMISSION_GRANTED) {
+            return;
+        }
+        requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, 101);
     }
 
     private void refreshSummary() {
@@ -156,17 +279,29 @@ public class MainActivity extends Activity {
     }
 
     private void requestSmsPermissions() {
-        if (checkSelfPermission(Manifest.permission.RECEIVE_SMS) == PackageManager.PERMISSION_GRANTED
+        boolean smsOk = checkSelfPermission(Manifest.permission.RECEIVE_SMS) == PackageManager.PERMISSION_GRANTED
                 && checkSelfPermission(Manifest.permission.SEND_SMS) == PackageManager.PERMISSION_GRANTED
-                && checkSelfPermission(Manifest.permission.READ_PHONE_STATE) == PackageManager.PERMISSION_GRANTED) {
+                && checkSelfPermission(Manifest.permission.READ_PHONE_STATE) == PackageManager.PERMISSION_GRANTED;
+        boolean notifOk = Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU
+                || checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED;
+        if (smsOk && notifOk) {
             return;
         }
 
-        requestPermissions(new String[]{
-                Manifest.permission.RECEIVE_SMS,
-                Manifest.permission.SEND_SMS,
-                Manifest.permission.READ_PHONE_STATE
-        }, 100);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            requestPermissions(new String[]{
+                    Manifest.permission.RECEIVE_SMS,
+                    Manifest.permission.SEND_SMS,
+                    Manifest.permission.READ_PHONE_STATE,
+                    Manifest.permission.POST_NOTIFICATIONS
+            }, 100);
+        } else {
+            requestPermissions(new String[]{
+                    Manifest.permission.RECEIVE_SMS,
+                    Manifest.permission.SEND_SMS,
+                    Manifest.permission.READ_PHONE_STATE
+            }, 100);
+        }
     }
 
     private void runLlmTest() {

@@ -13,6 +13,15 @@ public final class GatewayConfig {
     public static final String KEY_ALLOWED_SENDERS = "allowed_senders";
     public static final String KEY_MAX_REPLY_CHARS = "max_reply_chars";
     public static final String KEY_LAST_STATUS = "last_status";
+    public static final String KEY_KEEP_ALIVE = "keep_alive";
+
+    // Keep-alive (foreground service + boot + periodic heartbeat).
+    public static final String NOTIFICATION_CHANNEL_ID = "sms_llm_gateway_keepalive";
+    public static final String NOTIFICATION_CHANNEL_NAME = "Шлюз работает";
+    public static final int KEEP_ALIVE_NOTIFICATION_ID = 0x53_4D_53_01;
+    public static final int KEEP_ALIVE_HEARTBEAT_JOB_ID = 0x53_4D_53_02;
+    /** 15 minutes is JobScheduler's minimum periodic interval. */
+    public static final long KEEP_ALIVE_HEARTBEAT_INTERVAL_MS = 15L * 60L * 1000L;
 
     // Per-sender preferences (stored via ConversationStore)
     public static final String SENDER_KEY_MODEL = "model";

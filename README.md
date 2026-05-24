@@ -126,6 +126,46 @@ PRESET coder && TOKENS 400 && THINK on && STATUS
 - **Глобальные** (одни для всего шлюза): `preset`, `chars`, `endpoint`, `api_key`, `allowed_senders`, `model` (как fallback).
 - **Per-sender** (свои у каждого номера отправителя): `model`, `tokens`, `temp`, `think`, `web`, активный чат, история сообщений.
 
+## Автономная работа (24/7)
+
+В приложении есть переключатель **«Поддерживать работу 24/7»** на главном экране. Когда он включён, шлюз сам пытается остаться живым между перезагрузками, свайпами из recents и системными оптимизациями.
+
+Подключено сразу семь слоёв защиты — потому что современный Android (особенно сборки Xiaomi/Huawei/Samsung/Oppo) активно убивает фоновые приложения, и одного механизма обычно не хватает:
+
+1. **Foreground service** (`KeepAliveService`) с постоянным уведомлением — главный якорь. Канал уведомлений `IMPORTANCE_LOW`, без звуков, не свайпается.
+2. **`START_STICKY`** — система переподнимает сервис, если убила его сама.
+3. **`onTaskRemoved` + `AlarmManager`** — после свайпа приложения из недавних задач планируется перезапуск через 2 секунды.
+4. **Boot receiver** (`BOOT_COMPLETED`, `LOCKED_BOOT_COMPLETED`, `MY_PACKAGE_REPLACED`, `QUICKBOOT_POWERON`) — поднимает сервис сразу после загрузки телефона или после обновления APK.
+5. **Periodic heartbeat** (`KeepAliveJobService`, JobScheduler, persisted, 15 мин) — если сервис всё-таки умер, ближайший пинг пересоздаст его. Job планируется через системный `JobScheduler`, который не зависит от жизни нашего процесса.
+6. **Persisted SMS job** — `SmsReceiver` помечает заскедуленные SMS-job-ы как `setPersisted(true)`, чтобы SMS, прилетевшая прямо перед kill/ребутом, не потерялась.
+7. **Self-heal при `onResume`** — каждое открытие приложения вызывает `ensureStarted()`. Это легально стартует foreground service даже на Android 12+ (там, где стартовать его из фона нельзя).
+
+### Что нужно сделать пользователю один раз
+
+После установки приложения откройте его и проделайте:
+
+1. **«Запросить SMS-разрешения»** — даст `RECEIVE_SMS`, `SEND_SMS`, `READ_PHONE_STATE` и (на Android 13+) `POST_NOTIFICATIONS`.
+2. Включите **«Шлюз включен»**.
+3. Включите **«Поддерживать работу 24/7»**.
+4. Нажмите **«Отключить экономию батареи для шлюза»** — откроется системный диалог, нажмите «Разрешить». Без этого Doze может приостановить процесс.
+5. На Xiaomi/Huawei/Oppo/Vivo и подобных: нажмите **«Открыть autostart (OEM)»** — приложение найдёт нужный экран производителя и предложит включить шлюз в список разрешённых для автозапуска и фоновой работы. Без этого никакие системные защиты Android не помогут — производитель режет всё сам.
+
+### Особенности OEM
+
+| Производитель | Что обязательно нужно сделать |
+|---|---|
+| **Xiaomi (MIUI/HyperOS)** | Включить Autostart, дать «Нет ограничений» в энергосбережении, включить «Использование в фоне» |
+| **Huawei/Honor (EMUI/HarmonyOS)** | App launch → Manage manually → разрешить Auto-launch, Secondary launch, Run in background |
+| **Oppo/Realme (ColorOS)** | App Management → разрешить Autostart, выключить «Power Saver» для приложения |
+| **OnePlus (OxygenOS)** | Battery → Battery optimization → «Don't optimize» для приложения, плюс Recent apps → закрепить (lock) карточку |
+| **Vivo/iQOO** | i Manager → Autostart manager → включить; Background power consumption → разрешить |
+| **Samsung (One UI)** | Battery → Background usage limits → Never sleeping apps → добавить |
+| **Стандартный Android (Pixel, AOSP)** | Достаточно встроенного «Отключить экономию батареи» — OEM-меню отсутствует, кнопка откроет общие настройки приложения |
+
+### Что произойдёт, если keep-alive выключен
+
+Шлюз всё ещё может принимать SMS через `BroadcastReceiver`, но Android волен убить процесс в любой момент. На стоковом Pixel это редко мешает, на любом другом смартфоне приложение может «исчезать» через несколько часов простоя.
+
 ## Тест на эмуляторе
 
 На Android Emulator можно проверить прием SMS, настройки, команды и запрос к LLM без физической SIM:
@@ -153,8 +193,9 @@ PRESET coder && TOKENS 400 && THINK on && STATUS
 
 - `TextSanitizerTest`, `PhoneMatcherTest`, `PromptPresetsTest`, `ModelCatalogTest`, `LlmMarkersTest` — pure Java.
 - `LlmClientResponseParserTest` — парсинг OpenAI-compatible JSON-ответов (включая мультимодальные content-массивы, reasoning, refusal, top-level text).
-- `commands/CommandParserTest`, `commands/CommandRouterTest` — гибридный синтаксис SMS, валидация значений, выбор моделей.
+- `commands/CommandParserTest`, `commands/CommandRouterTest`, `commands/CommandBatchTest` — гибридный синтаксис SMS, валидация значений, выбор моделей, батч из нескольких команд через `&&`.
 - `ConversationStoreRobolectricTest`, `commands/PrefsSettingsGatewayRobolectricTest` — Robolectric, проверяют сохранение/чтение SharedPreferences, изоляцию per-sender, дефолты, лимиты и `RESET`.
+- `keepalive/*Test` — keep-alive (foreground service, boot receiver, OEM autostart helper, periodic heartbeat).
 
 ## Важные ограничения
 

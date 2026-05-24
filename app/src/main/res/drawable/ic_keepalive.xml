@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24"
+    android:tint="?android:attr/colorAccent">
+    <!-- Simple white-on-transparent chat-bubble + antenna glyph for the
+         ongoing foreground notification. Status-bar icons must be a single
+         solid colour so the system can tint them. -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M4,4h16a2,2 0 0,1 2,2v10a2,2 0 0,1 -2,2H8l-4,4V6a2,2 0 0,1 2,-2zM7,9h10v2H7zM7,12h7v2H7z" />
+</vector>

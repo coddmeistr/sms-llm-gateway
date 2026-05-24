@@ -75,13 +75,24 @@ public class SmsReceiver extends android.content.BroadcastReceiver {
         // so practical wrap-around (after >2 billion SMS) is not a concern.
         int jobId = JOB_ID.incrementAndGet();
 
-        JobInfo jobInfo = new JobInfo.Builder(
+        JobInfo.Builder builder = new JobInfo.Builder(
                 jobId,
                 new ComponentName(context, SmsReplyJobService.class))
                 .setExtras(extras)
                 .setRequiredNetworkType(JobInfo.NETWORK_TYPE_ANY)
-                .setOverrideDeadline(0)
-                .build();
+                .setOverrideDeadline(0);
+        // Persist the job so SMSes that arrive moments before the OS kills our
+        // process — or right before the user reboots — are still answered after
+        // recovery instead of vanishing.
+        try {
+            builder.setPersisted(true);
+        } catch (Throwable e) {
+            // setPersisted requires RECEIVE_BOOT_COMPLETED. The manifest grants
+            // it, but some custom ROMs revoke it. Fall back to a non-persistent
+            // job rather than crashing the whole receiver.
+            Log.w(TAG, "setPersisted unavailable, falling back to non-persistent job", e);
+        }
+        JobInfo jobInfo = builder.build();
 
         JobScheduler scheduler = (JobScheduler) context.getSystemService(Context.JOB_SCHEDULER_SERVICE);
         if (scheduler == null || scheduler.schedule(jobInfo) != JobScheduler.RESULT_SUCCESS) {
